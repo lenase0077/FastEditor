@@ -778,12 +778,12 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // ============================================================
 //  RENDER EDITOR
 // ============================================================
-static void RenderScrollbar(Document& ed, ImVec2 canvas_p0, ImVec2 canvas_sz, bool dark) {
+static bool RenderScrollbar(Document& ed, ImVec2 canvas_p0, ImVec2 canvas_sz, bool dark) {
     float line_height = ImGui::GetTextLineHeight();
     float canvas_h = canvas_sz.y;
     float content_height = ed.buffer.line_count() * line_height;
 
-    if (content_height <= canvas_h) return; // No scrollbar needed
+    if (content_height <= canvas_h) return false; // No scrollbar needed
 
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     ImGuiIO& io = ImGui::GetIO();
@@ -862,10 +862,12 @@ static void RenderScrollbar(Document& ed, ImVec2 canvas_p0, ImVec2 canvas_sz, bo
             }
         }
     }
+
+    return hovering_track || hovering_thumb || ed.scrollbar_dragging;
 }
 
-static void RenderEditor(App& app, ImVec2 canvas_p0, ImVec2 canvas_sz, bool canvas_hovered) {
-    if (!app.has_doc()) return;
+static bool RenderEditor(App& app, ImVec2 canvas_p0, ImVec2 canvas_sz, bool canvas_hovered) {
+    if (!app.has_doc()) return false;
     Document& ed = app.doc();
     ImGuiIO& io = ImGui::GetIO();
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
@@ -1023,7 +1025,8 @@ static void RenderEditor(App& app, ImVec2 canvas_p0, ImVec2 canvas_sz, bool canv
     draw_list->PopClipRect();
 
     // RENDER SCROLLBAR (outside clip rect so it's always visible)
-    RenderScrollbar(ed, canvas_p0, canvas_sz, dark);
+    // Retorna true si el mouse esta interactuando con el scrollbar
+    return RenderScrollbar(ed, canvas_p0, canvas_sz, dark);
 }
 
 // ============================================================
@@ -1536,13 +1539,19 @@ int main(int, char**)
             app.doc().selecting_words = false;
         }
 
-        if (is_hovered && ImGui::IsMouseDoubleClicked(0)) {
-            HandleMouseClick(app, canvas_p0, false, false, true);
-        } else if (ImGui::IsItemClicked()) {
-            HandleMouseClick(app, canvas_p0, true, false, false);
-        }
-        if (is_active && ImGui::IsMouseDragging(0)) {
-            HandleMouseClick(app, canvas_p0, false, true, false);
+        // Render text FIRST to detect scrollbar interaction
+        bool scrollbar_active = RenderEditor(app, canvas_p0, canvas_sz, is_hovered);
+
+        // Only process editor mouse clicks if NOT interacting with scrollbar
+        if (!scrollbar_active) {
+            if (is_hovered && ImGui::IsMouseDoubleClicked(0)) {
+                HandleMouseClick(app, canvas_p0, false, false, true);
+            } else if (ImGui::IsItemClicked()) {
+                HandleMouseClick(app, canvas_p0, true, false, false);
+            }
+            if (is_active && ImGui::IsMouseDragging(0)) {
+                HandleMouseClick(app, canvas_p0, false, true, false);
+            }
         }
 
         if (is_hovered && ImGui::IsMouseClicked(1)) {
@@ -1559,9 +1568,6 @@ int main(int, char**)
             if (ImGui::MenuItem("Find", "Ctrl+F")) app.doc().show_search = true;
             ImGui::EndPopup();
         }
-
-        // Render text
-        RenderEditor(app, canvas_p0, canvas_sz, is_hovered);
 
         // Handle keyboard
         if (is_hovered || is_active) {
