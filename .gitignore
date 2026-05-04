@@ -1,0 +1,23 @@
+# Compiled binaries
+*.exe
+*.dll
+*.o
+*.obj
+
+# Build directories
+bin/
+obj/
+Debug/
+Release/
+
+# IDE files
+*.layout
+*.depend
+*.cbp.bak
+
+# Temporary files
+*.tmp
+*.log
+
+# ImGui demo is not needed for the editor
+# (but we keep other imgui files as they are required)
