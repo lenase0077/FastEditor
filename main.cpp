@@ -724,6 +724,24 @@ struct App {
         active_doc = (int)docs.size() - 1;
     }
 
+    void load_recent() {
+        std::ifstream f("FastEditor.cfg");
+        if (!f) return;
+        recent_files.clear();
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty()) recent_files.push_back(line);
+        }
+    }
+
+    void save_recent() {
+        std::ofstream f("FastEditor.cfg");
+        if (!f) return;
+        for (const std::string& rf : recent_files) {
+            f << rf << "\n";
+        }
+    }
+
     void add_recent(const std::string& fname) {
         if (fname.empty()) return;
         // Eliminar si ya existe
@@ -733,6 +751,8 @@ struct App {
         recent_files.insert(recent_files.begin(), fname);
         // Mantener maximo 10
         if (recent_files.size() > 10) recent_files.resize(10);
+        // Guardar en disco
+        save_recent();
     }
 
     void open_doc(const std::string& fname) {
@@ -1309,6 +1329,7 @@ int main(int, char**)
     App app;
     app.hwnd = hwnd;
     app.new_doc(); // Start with one empty doc
+    app.load_recent(); // Cargar archivos recientes del disco
 
     bool done = false;
 
