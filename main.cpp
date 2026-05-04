@@ -368,6 +368,24 @@ struct Document {
     float scrollbar_drag_start_y = 0.0f;
     float scrollbar_drag_start_scroll = 0.0f;
 
+    // Undo/Redo
+    struct EditAction {
+        enum Type { ACT_INSERT, ACT_REMOVE } type;
+        size_t pos;
+        std::string text;
+    };
+    std::vector<EditAction> undo_stack;
+    std::vector<EditAction> redo_stack;
+    bool recording = true;
+    enum { MAX_UNDO = 500 };
+
+    // Goto line
+    bool show_goto = false;
+    char goto_line_str[16] = {};
+
+    // Replace
+    char replace_query[256] = {};
+
     Document() {}
     Document(const std::string& fname) {
         filename = fname;
@@ -388,10 +406,77 @@ struct Document {
         preferred_col = buffer.col(pos);
     }
 
+    void record_insert(size_t pos, const std::string& text) {
+        if (!recording || text.empty()) return;
+        if (!undo_stack.empty() && undo_stack.back().type == EditAction::ACT_INSERT &&
+            undo_stack.back().pos + undo_stack.back().text.size() == pos) {
+            undo_stack.back().text += text;
+        } else {
+            if (undo_stack.size() >= MAX_UNDO) undo_stack.erase(undo_stack.begin());
+            undo_stack.push_back({EditAction::ACT_INSERT, pos, text});
+        }
+        redo_stack.clear();
+    }
+
+    void record_delete(size_t pos, const std::string& text) {
+        if (!recording || text.empty()) return;
+        if (!undo_stack.empty() && undo_stack.back().type == EditAction::ACT_REMOVE &&
+            undo_stack.back().pos == pos) {
+            undo_stack.back().text += text;
+        } else {
+            if (undo_stack.size() >= MAX_UNDO) undo_stack.erase(undo_stack.begin());
+            undo_stack.push_back({EditAction::ACT_REMOVE, pos, text});
+        }
+        redo_stack.clear();
+    }
+
+    void undo() {
+        if (undo_stack.empty()) return;
+        recording = false;
+        EditAction act = undo_stack.back();
+        undo_stack.pop_back();
+        if (act.type == EditAction::ACT_INSERT) {
+            buffer.erase(act.pos, act.text.size());
+            cursor = act.pos;
+        } else {
+            buffer.move_gap(act.pos);
+            buffer.insert(act.text.c_str(), act.text.size());
+            cursor = act.pos + act.text.size();
+        }
+        set_cursor(cursor);
+        redo_stack.push_back(act);
+        recording = true;
+        dirty = true;
+        cursor_moved = true;
+    }
+
+    void redo() {
+        if (redo_stack.empty()) return;
+        recording = false;
+        EditAction act = redo_stack.back();
+        redo_stack.pop_back();
+        if (act.type == EditAction::ACT_INSERT) {
+            buffer.move_gap(act.pos);
+            buffer.insert(act.text.c_str(), act.text.size());
+            cursor = act.pos + act.text.size();
+        } else {
+            buffer.erase(act.pos, act.text.size());
+            cursor = act.pos;
+        }
+        set_cursor(cursor);
+        undo_stack.push_back(act);
+        recording = true;
+        dirty = true;
+        cursor_moved = true;
+    }
+
     void delete_selection() {
         if (!has_selection) return;
         size_t start = std::min(select_start, select_end);
         size_t end = std::max(select_start, select_end);
+        std::string deleted; deleted.reserve(end - start);
+        for (size_t i = start; i < end; ++i) deleted.push_back(buffer.get(i));
+        record_delete(start, deleted);
         buffer.erase(start, end - start);
         cursor = start;
         set_cursor(start);
@@ -401,32 +486,32 @@ struct Document {
 
     void insert_char(char c) {
         if (has_selection) delete_selection();
-        else {
-            buffer.move_gap(cursor);
-            buffer.insert(c);
-            cursor++;
-            set_cursor(cursor);
-            dirty = true;
-            cursor_moved = true;
-        }
+        buffer.move_gap(cursor);
+        buffer.insert(c);
+        record_insert(cursor, std::string(1, c));
+        cursor++;
+        set_cursor(cursor);
+        dirty = true;
+        cursor_moved = true;
     }
 
     void insert_string(const std::string& s) {
         if (has_selection) delete_selection();
-        else {
-            buffer.insert(s.c_str(), s.size());
-            cursor += s.size();
-            set_cursor(cursor);
-            dirty = true;
-            cursor_moved = true;
-        }
+        buffer.insert(s.c_str(), s.size());
+        record_insert(cursor, s);
+        cursor += s.size();
+        set_cursor(cursor);
+        dirty = true;
+        cursor_moved = true;
     }
 
     void backspace() {
-        if (has_selection) delete_selection();
-        else if (cursor > 0) {
+        if (has_selection) { delete_selection(); return; }
+        if (cursor > 0) {
+            char c = buffer.get(cursor - 1);
             buffer.erase(cursor - 1, 1);
             cursor--;
+            record_delete(cursor, std::string(1, c));
             set_cursor(cursor);
             dirty = true;
             cursor_moved = true;
@@ -434,9 +519,11 @@ struct Document {
     }
 
     void del() {
-        if (has_selection) delete_selection();
-        else if (cursor < buffer.size()) {
+        if (has_selection) { delete_selection(); return; }
+        if (cursor < buffer.size()) {
+            char c = buffer.get(cursor);
             buffer.erase(cursor, 1);
+            record_delete(cursor, std::string(1, c));
             dirty = true;
             cursor_moved = true;
         }
@@ -446,14 +533,15 @@ struct Document {
         if (has_selection) { delete_selection(); return; }
         if (cursor == 0) return;
         size_t start = cursor;
-        // Saltar espacios/tab
         while (start > 0 && (buffer.get(start - 1) == ' ' || buffer.get(start - 1) == '\t')) --start;
-        // Borrar token (palabra o simbolos)
         if (start > 0) {
             bool is_id = IsKeywordChar(buffer.get(start - 1));
             while (start > 0 && IsKeywordChar(buffer.get(start - 1)) == is_id) --start;
         }
         if (start < cursor) {
+            std::string deleted; deleted.reserve(cursor - start);
+            for (size_t i = start; i < cursor; ++i) deleted.push_back(buffer.get(i));
+            record_delete(start, deleted);
             buffer.erase(start, cursor - start);
             cursor = start;
             set_cursor(cursor);
@@ -490,6 +578,15 @@ struct Document {
     void move_home(bool sel = false) { set_cursor(buffer.line_start(cursor), sel); cursor_moved = true; }
     void move_end(bool sel = false)  { set_cursor(buffer.line_end(cursor), sel); cursor_moved = true; }
 
+    void goto_line(size_t line) {
+        if (line < 1) line = 1;
+        size_t max_line = buffer.line_count();
+        if (line > max_line) line = max_line;
+        size_t pos = buffer.pos_from_line_col(line - 1, 0);
+        set_cursor(pos);
+        cursor_moved = true;
+    }
+
     void select_all() {
         select_start = 0;
         select_end = buffer.size();
@@ -497,35 +594,23 @@ struct Document {
         has_selection = (buffer.size() > 0);
     }
 
-    // Selecciona la palabra en la posicion dada (doble click)
     void select_word_at(size_t pos) {
         if (pos >= buffer.size()) pos = buffer.size();
         if (buffer.size() == 0) { select_start = select_end = cursor = 0; has_selection = false; return; }
-
-        // Si es un espacio/tab/newline, no seleccionamos nada o seleccionamos el bloque de espacios
         if (pos < buffer.size() && !IsKeywordChar(buffer.get(pos))) {
             size_t start = pos;
             size_t end = pos;
             while (start > 0 && !IsKeywordChar(buffer.get(start - 1))) --start;
             while (end < buffer.size() && !IsKeywordChar(buffer.get(end))) ++end;
-            select_start = start;
-            select_end = end;
-            cursor = end;
+            select_start = start; select_end = end; cursor = end;
             has_selection = (start != end);
             return;
         }
-
-        // Encontrar inicio de la palabra
         size_t start = pos;
         while (start > 0 && IsKeywordChar(buffer.get(start - 1))) --start;
-
-        // Encontrar fin de la palabra
         size_t end = pos;
         while (end < buffer.size() && IsKeywordChar(buffer.get(end))) ++end;
-
-        select_start = start;
-        select_end = end;
-        cursor = end;
+        select_start = start; select_end = end; cursor = end;
         has_selection = (start != end);
     }
 
@@ -558,6 +643,57 @@ struct Document {
                 if (buffer.get(i + j) != search_query[j]) { match = false; break; }
             if (match) { search_result = i; set_cursor(i + qLen); cursor_moved = true; return; }
         }
+    }
+
+    void replace_next() {
+        size_t qLen = strlen(search_query);
+        size_t rLen = strlen(replace_query);
+        if (qLen == 0) return;
+        if (search_result != (size_t)-1 && search_result + qLen <= buffer.size()) {
+            bool match = true;
+            for (size_t j = 0; j < qLen; ++j)
+                if (buffer.get(search_result + j) != search_query[j]) { match = false; break; }
+            if (match) {
+                std::string del; del.reserve(qLen);
+                for (size_t k = 0; k < qLen; ++k) del.push_back(buffer.get(search_result + k));
+                record_delete(search_result, del);
+                buffer.erase(search_result, qLen);
+                if (rLen > 0) {
+                    buffer.move_gap(search_result);
+                    buffer.insert(replace_query, rLen);
+                    record_insert(search_result, std::string(replace_query, rLen));
+                }
+                cursor = search_result + rLen;
+                dirty = true; cursor_moved = true;
+                find_next(); return;
+            }
+        }
+        find_next();
+    }
+
+    void replace_all() {
+        size_t qLen = strlen(search_query);
+        size_t rLen = strlen(replace_query);
+        if (qLen == 0) return;
+        recording = false;
+        size_t i = 0;
+        while (i + qLen <= buffer.size()) {
+            bool match = true;
+            for (size_t j = 0; j < qLen; ++j)
+                if (buffer.get(i + j) != search_query[j]) { match = false; break; }
+            if (match) {
+                buffer.erase(i, qLen);
+                if (rLen > 0) {
+                    buffer.move_gap(i);
+                    buffer.insert(replace_query, rLen);
+                }
+                i += rLen;
+            } else ++i;
+        }
+        recording = true;
+        undo_stack.clear(); redo_stack.clear(); // Clear undo for bulk replace
+        dirty = true; cursor_moved = true;
+        search_result = (size_t)-1;
     }
 
     void save() {
@@ -794,6 +930,14 @@ static void RenderEditor(App& app, ImVec2 canvas_p0, ImVec2 canvas_sz, bool canv
             ln_col = dark ? IM_COL32(200, 200, 200, 255) : IM_COL32(50, 50, 50, 255);
         draw_list->AddText(ImVec2(canvas_p0.x + 4, y), ln_col, line_num);
 
+        // Highlight current line
+        if (current_line == ed.buffer.line_of(ed.cursor)) {
+            draw_list->AddRectFilled(
+                ImVec2(canvas_p0.x + line_num_width, y), ImVec2(canvas_p0.x + canvas_sz.x, y + line_height),
+                dark ? IM_COL32(40, 44, 52, 255) : IM_COL32(235, 235, 240, 255)
+            );
+        }
+
         // Selection background for this line
         if (ed.has_selection) {
             size_t sel_start = std::min(ed.select_start, ed.select_end);
@@ -918,8 +1062,10 @@ static void HandleInput(App& app) {
         }
     }
 
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) ed.show_search = false;
-    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_F)) ed.show_search = !ed.show_search;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) { ed.show_search = false; ed.show_goto = false; }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_F)) { ed.show_search = !ed.show_search; ed.show_goto = false; }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_H)) { ed.show_search = !ed.show_search; ed.show_goto = false; }
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_G)) { ed.show_goto = !ed.show_goto; ed.show_search = false; }
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_N)) app.new_doc();
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O)) {
         app.block_shortcuts = true;
@@ -938,6 +1084,9 @@ static void HandleInput(App& app) {
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_C)) ed.copy();
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_X)) ed.cut();
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_V)) ed.paste();
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Z)) ed.undo();
+    if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Y)) ed.redo();
+    if (ctrl && shift && ImGui::IsKeyPressed(ImGuiKey_Z)) ed.redo();
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_Backspace)) ed.delete_word_left();
     else if (ImGui::IsKeyPressed(ImGuiKey_Backspace)) ed.backspace();
     if (ImGui::IsKeyPressed(ImGuiKey_Delete)) ed.del();
@@ -962,8 +1111,19 @@ static void HandleInput(App& app) {
     if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))  ed.move_down(shift);
     if (ImGui::IsKeyPressed(ImGuiKey_Home))       ed.move_home(shift);
     if (ImGui::IsKeyPressed(ImGuiKey_End))        ed.move_end(shift);
-    if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) ed.insert_char('\n');
-    if (ImGui::IsKeyPressed(ImGuiKey_Tab))        ed.insert_char('\t');
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
+        // Auto-indent: copy leading whitespace from current line
+        size_t line_start = ed.buffer.line_start(ed.cursor);
+        std::string indent;
+        for (size_t i = line_start; i < ed.buffer.size() && (ed.buffer.get(i) == ' ' || ed.buffer.get(i) == '\t'); ++i)
+            indent.push_back(ed.buffer.get(i));
+        ed.insert_char('\n');
+        if (!indent.empty()) ed.insert_string(indent);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Tab)) {
+        // Insert 4 spaces instead of raw tab character
+        ed.insert_string("    ");
+    }
 }
 
 // ============================================================
@@ -1213,14 +1373,17 @@ int main(int, char**)
             }
             if (ImGui::BeginMenu("Edit")) {
                 if (app.has_doc()) {
-                    if (ImGui::MenuItem("Undo", "Ctrl+Z")) {}
-                    if (ImGui::MenuItem("Redo", "Ctrl+Y")) {}
+                    if (ImGui::MenuItem("Undo", "Ctrl+Z", false, !app.doc().undo_stack.empty())) app.doc().undo();
+                    if (ImGui::MenuItem("Redo", "Ctrl+Y", false, !app.doc().redo_stack.empty())) app.doc().redo();
                     ImGui::Separator();
                     if (ImGui::MenuItem("Cut", "Ctrl+X")) app.doc().cut();
                     if (ImGui::MenuItem("Copy", "Ctrl+C")) app.doc().copy();
                     if (ImGui::MenuItem("Paste", "Ctrl+V")) app.doc().paste();
                     ImGui::Separator();
-                    if (ImGui::MenuItem("Find", "Ctrl+F")) app.doc().show_search = !app.doc().show_search;
+                    if (ImGui::MenuItem("Find", "Ctrl+F")) { app.doc().show_search = !app.doc().show_search; app.doc().show_goto = false; }
+                    if (ImGui::MenuItem("Find & Replace", "Ctrl+H")) { app.doc().show_search = !app.doc().show_search; app.doc().show_goto = false; }
+                    if (ImGui::MenuItem("Go to Line", "Ctrl+G")) { app.doc().show_goto = !app.doc().show_goto; app.doc().show_search = false; }
+                    ImGui::Separator();
                     if (ImGui::MenuItem("Select All", "Ctrl+A")) app.doc().select_all();
                 }
                 ImGui::EndMenu();
@@ -1301,7 +1464,7 @@ int main(int, char**)
         }
         ImGui::Separator();
 
-        // ---- SEARCH BAR ----
+        // ---- SEARCH / REPLACE BAR ----
         if (app.has_doc() && app.doc().show_search) {
             Document& ed = app.doc();
             ImGui::PushStyleColor(ImGuiCol_FrameBg, app.dark_theme ? ImVec4(0.18f, 0.18f, 0.20f, 1.0f) : ImVec4(0.90f, 0.90f, 0.90f, 1.0f));
@@ -1309,12 +1472,45 @@ int main(int, char**)
             if (ImGui::InputText("Find", ed.search_query, sizeof(ed.search_query), ImGuiInputTextFlags_EnterReturnsTrue)) {
                 ed.find_next();
             }
+            ImGui::SameLine();
+            if (ImGui::InputText("Replace", ed.replace_query, sizeof(ed.replace_query), ImGuiInputTextFlags_EnterReturnsTrue)) {
+                ed.replace_next();
+            }
             ImGui::PopItemWidth();
             ImGui::PopStyleColor();
             ImGui::SameLine();
-            if (ImGui::SmallButton("Next")) ed.find_next();
+            if (ImGui::SmallButton("Find Next")) ed.find_next();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Replace")) ed.replace_next();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Replace All")) ed.replace_all();
             ImGui::SameLine();
             if (ImGui::SmallButton("Close")) ed.show_search = false;
+            ImGui::Separator();
+        }
+
+        // ---- GOTO LINE BAR ----
+        if (app.has_doc() && app.doc().show_goto) {
+            Document& ed = app.doc();
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, app.dark_theme ? ImVec4(0.18f, 0.18f, 0.20f, 1.0f) : ImVec4(0.90f, 0.90f, 0.90f, 1.0f));
+            ImGui::PushItemWidth(100);
+            if (ImGui::InputText("Go to line", ed.goto_line_str, sizeof(ed.goto_line_str), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsDecimal)) {
+                int line = atoi(ed.goto_line_str);
+                if (line > 0) ed.goto_line((size_t)line);
+                ed.show_goto = false;
+                memset(ed.goto_line_str, 0, sizeof(ed.goto_line_str));
+            }
+            ImGui::PopItemWidth();
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Go")) {
+                int line = atoi(ed.goto_line_str);
+                if (line > 0) ed.goto_line((size_t)line);
+                ed.show_goto = false;
+                memset(ed.goto_line_str, 0, sizeof(ed.goto_line_str));
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Close")) ed.show_goto = false;
             ImGui::Separator();
         }
 
@@ -1327,6 +1523,14 @@ int main(int, char**)
         ImGui::InvisibleButton("canvas", canvas_sz);
         bool is_hovered = ImGui::IsItemHovered();
         bool is_active = ImGui::IsItemActive();
+
+        // Zoom with Ctrl + mouse wheel
+        if (is_hovered && io.KeyCtrl && io.MouseWheel != 0.0f) {
+            float new_scale = io.FontGlobalScale + io.MouseWheel * 0.1f;
+            if (new_scale < 0.5f) new_scale = 0.5f;
+            if (new_scale > 3.0f) new_scale = 3.0f;
+            io.FontGlobalScale = new_scale;
+        }
 
         if (app.has_doc() && !ImGui::IsMouseDown(0)) {
             app.doc().selecting_words = false;
