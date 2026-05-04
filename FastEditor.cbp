@@ -54,6 +54,9 @@
 		<Unit filename="imgui/imgui_widgets.cpp" />
 		<Unit filename="imgui/imgui_impl_win32.cpp" />
 		<Unit filename="imgui/imgui_impl_opengl3.cpp" />
+		<Unit filename="resource.rc">
+			<Option compilerVar="WINDRES" />
+		</Unit>
 		<Extensions />
 	</Project>
 </CodeBlocks_project_file>
