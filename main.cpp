@@ -14,12 +14,14 @@
 #include <cstring>
 
 // ============================================================
-//  GAP BUFFER
+//  GAP BUFFER (with line offset cache for O(1) line lookups)
 // ============================================================
 class GapBuffer {
     std::vector<char> data;
     size_t gap_start = 0;
     size_t gap_end = 0;
+    mutable std::vector<size_t> line_offsets;
+    mutable bool lines_dirty = true;
 
     void grow() {
         size_t old_size = data.size();
@@ -30,6 +32,22 @@ class GapBuffer {
             memmove(&data[data.size() - tail_len], &data[gap_end], tail_len);
         gap_start = old_size - old_gap_len;
         gap_end = data.size() - tail_len;
+    }
+
+    void rebuild_lines() const {
+        line_offsets.clear();
+        line_offsets.push_back(0);
+        size_t sz = size();
+        for (size_t i = 0; i < sz; ++i) {
+            if (get(i) == '\n') {
+                line_offsets.push_back(i + 1);
+            }
+        }
+        lines_dirty = false;
+    }
+
+    void ensure_lines() const {
+        if (lines_dirty) rebuild_lines();
     }
 
 public:
@@ -53,6 +71,7 @@ public:
     void insert(char c) {
         if (gap_start == gap_end) grow();
         data[gap_start++] = c;
+        lines_dirty = true;
     }
 
     void insert(const char* s, size_t len) {
@@ -62,64 +81,83 @@ public:
     void erase(size_t pos, size_t len = 1) {
         move_gap(pos);
         gap_end = std::min(gap_end + len, data.size());
+        lines_dirty = true;
     }
 
     char get(size_t pos) const {
         return (pos < gap_start) ? data[pos] : data[pos + (gap_end - gap_start)];
     }
 
-    void clear() { data.resize(4096); gap_start = 0; gap_end = data.size(); }
+    void clear() {
+        data.resize(4096);
+        gap_start = 0;
+        gap_end = data.size();
+        line_offsets.clear();
+        line_offsets.push_back(0);
+        lines_dirty = false;
+    }
 
     size_t line_count() const {
-        size_t lines = 1;
-        for (size_t i = 0; i < size(); ++i)
-            if (get(i) == '\n') ++lines;
-        return lines;
+        ensure_lines();
+        return line_offsets.size();
     }
 
     size_t line_start(size_t pos) const {
+        ensure_lines();
         if (pos == 0) return 0;
-        while (pos > 0 && get(pos - 1) != '\n') --pos;
-        return pos;
+        size_t line = line_of(pos);
+        if (line < line_offsets.size()) return line_offsets[line];
+        return size();
     }
 
     size_t line_end(size_t pos) const {
-        while (pos < size() && get(pos) != '\n') ++pos;
-        return pos;
+        ensure_lines();
+        size_t line = line_of(pos);
+        if (line + 1 < line_offsets.size()) {
+            // line_offsets[line+1] is the start of next line, so -1 is the \n position
+            return line_offsets[line + 1] - 1;
+        }
+        return size();
     }
 
     size_t prev_line_start(size_t pos) const {
-        size_t s = line_start(pos);
-        if (s == 0) return 0;
-        return line_start(s - 1);
+        ensure_lines();
+        size_t line = line_of(pos);
+        if (line == 0) return 0;
+        return line_offsets[line - 1];
     }
 
     size_t next_line_start(size_t pos) const {
-        size_t e = line_end(pos);
-        if (e >= size()) return size();
-        return e + 1;
+        ensure_lines();
+        size_t line = line_of(pos);
+        if (line + 1 < line_offsets.size()) return line_offsets[line + 1];
+        return size();
     }
 
     size_t col(size_t pos) const { return pos - line_start(pos); }
 
     size_t line_of(size_t pos) const {
-        size_t line = 0;
-        for (size_t i = 0; i < pos; ++i)
-            if (get(i) == '\n') ++line;
-        return line;
+        ensure_lines();
+        if (line_offsets.empty()) return 0;
+        if (pos >= size()) return line_offsets.size() - 1;
+        // Binary search: largest i where line_offsets[i] <= pos
+        size_t lo = 0, hi = line_offsets.size();
+        while (lo + 1 < hi) {
+            size_t mid = (lo + hi) / 2;
+            if (line_offsets[mid] <= pos) lo = mid;
+            else hi = mid;
+        }
+        return lo;
     }
 
     size_t pos_from_line_col(size_t line, size_t target_col) const {
-        size_t current_line = 0;
-        size_t i = 0;
-        while (i < size() && current_line < line) {
-            if (get(i) == '\n') ++current_line;
-            ++i;
-        }
-        size_t end = line_end(i);
-        size_t len = end - i;
+        ensure_lines();
+        if (line >= line_offsets.size()) return size();
+        size_t start = line_offsets[line];
+        size_t end = (line + 1 < line_offsets.size()) ? line_offsets[line + 1] - 1 : size();
+        size_t len = end - start;
         if (target_col > len) target_col = len;
-        return i + target_col;
+        return start + target_col;
     }
 };
 
@@ -322,9 +360,13 @@ struct Document {
     bool show_search = false;
     char search_query[256] = {};
     size_t search_result = (size_t)-1;
-    bool cursor_moved = false; // Se activa cuando el cursor se mueve por teclado (para auto-scroll)
-    bool selecting_words = false; // Modo seleccion por palabras (doble click + drag)
-    size_t word_select_anchor = 0; // Punto de anclaje para seleccion por palabras
+    bool cursor_moved = false;
+    bool selecting_words = false;
+    size_t word_select_anchor = 0;
+    // Scrollbar state
+    bool scrollbar_dragging = false;
+    float scrollbar_drag_start_y = 0.0f;
+    float scrollbar_drag_start_scroll = 0.0f;
 
     Document() {}
     Document(const std::string& fname) {
@@ -534,6 +576,8 @@ struct App {
     int active_doc = -1;
     bool dark_theme = true;
     HWND hwnd;
+    bool block_shortcuts = false;
+    std::vector<std::string> recent_files;
 
     Document& doc() { return docs[active_doc]; }
     bool has_doc() const { return active_doc >= 0 && active_doc < (int)docs.size(); }
@@ -544,12 +588,24 @@ struct App {
         active_doc = (int)docs.size() - 1;
     }
 
+    void add_recent(const std::string& fname) {
+        if (fname.empty()) return;
+        // Eliminar si ya existe
+        auto it = std::find(recent_files.begin(), recent_files.end(), fname);
+        if (it != recent_files.end()) recent_files.erase(it);
+        // Agregar al principio
+        recent_files.insert(recent_files.begin(), fname);
+        // Mantener maximo 10
+        if (recent_files.size() > 10) recent_files.resize(10);
+    }
+
     void open_doc(const std::string& fname) {
         for (int i = 0; i < (int)docs.size(); ++i) {
             if (docs[i].filename == fname) { active_doc = i; return; }
         }
         docs.emplace_back(fname);
         active_doc = (int)docs.size() - 1;
+        add_recent(fname);
     }
 
     void close_doc(int idx) {
@@ -586,6 +642,92 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // ============================================================
 //  RENDER EDITOR
 // ============================================================
+static void RenderScrollbar(Document& ed, ImVec2 canvas_p0, ImVec2 canvas_sz, bool dark) {
+    float line_height = ImGui::GetTextLineHeight();
+    float canvas_h = canvas_sz.y;
+    float content_height = ed.buffer.line_count() * line_height;
+
+    if (content_height <= canvas_h) return; // No scrollbar needed
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    ImGuiIO& io = ImGui::GetIO();
+
+    const float scrollbar_width = 12.0f;
+    const float scrollbar_x = canvas_p0.x + canvas_sz.x - scrollbar_width - 2.0f;
+    const float scrollbar_y = canvas_p0.y + 2.0f;
+    const float scrollbar_h = canvas_h - 4.0f;
+    const float thumb_min_height = 30.0f;
+
+    float max_scroll = content_height - canvas_h;
+    float scroll_ratio = ed.scroll_y / max_scroll;
+
+    // Calculate thumb size proportional to visible content
+    float thumb_h = (canvas_h / content_height) * scrollbar_h;
+    if (thumb_h < thumb_min_height) thumb_h = thumb_min_height;
+
+    float track_h = scrollbar_h - thumb_h;
+    float thumb_y = scrollbar_y + scroll_ratio * track_h;
+
+    // Track (background)
+    ImVec2 track_p0(scrollbar_x, scrollbar_y);
+    ImVec2 track_p1(scrollbar_x + scrollbar_width, scrollbar_y + scrollbar_h);
+
+    // Determine hover/active states
+    ImVec2 mouse = io.MousePos;
+    bool hovering_track = (mouse.x >= track_p0.x && mouse.x <= track_p1.x &&
+                           mouse.y >= track_p0.y && mouse.y <= track_p1.y);
+    bool hovering_thumb = (mouse.x >= track_p0.x && mouse.x <= track_p1.x &&
+                           mouse.y >= thumb_y && mouse.y <= thumb_y + thumb_h);
+
+    // Draw track (subtle, only visible on hover or when dragging)
+    if (ed.scrollbar_dragging || hovering_track) {
+        ImU32 track_col = dark ? IM_COL32(60, 60, 65, 120) : IM_COL32(200, 200, 200, 120);
+        draw_list->AddRectFilled(track_p0, track_p1, track_col, 6.0f);
+    }
+
+    // Draw thumb
+    ImU32 thumb_col;
+    if (ed.scrollbar_dragging) {
+        thumb_col = dark ? IM_COL32(140, 140, 150, 255) : IM_COL32(100, 100, 110, 255);
+    } else if (hovering_thumb) {
+        thumb_col = dark ? IM_COL32(120, 120, 130, 255) : IM_COL32(120, 120, 130, 255);
+    } else {
+        thumb_col = dark ? IM_COL32(80, 80, 85, 200) : IM_COL32(160, 160, 160, 200);
+    }
+
+    ImVec2 thumb_p0(scrollbar_x + 2.0f, thumb_y);
+    ImVec2 thumb_p1(scrollbar_x + scrollbar_width - 2.0f, thumb_y + thumb_h);
+    draw_list->AddRectFilled(thumb_p0, thumb_p1, thumb_col, 5.0f);
+
+    // Handle interactions
+    if (ed.scrollbar_dragging) {
+        if (ImGui::IsMouseDown(0)) {
+            float delta_y = mouse.y - ed.scrollbar_drag_start_y;
+            float new_scroll_ratio = (ed.scrollbar_drag_start_scroll + delta_y) / track_h;
+            if (new_scroll_ratio < 0.0f) new_scroll_ratio = 0.0f;
+            if (new_scroll_ratio > 1.0f) new_scroll_ratio = 1.0f;
+            ed.scroll_y = new_scroll_ratio * max_scroll;
+        } else {
+            ed.scrollbar_dragging = false;
+        }
+    } else {
+        // Click on thumb to start dragging
+        if (hovering_thumb && ImGui::IsMouseClicked(0)) {
+            ed.scrollbar_dragging = true;
+            ed.scrollbar_drag_start_y = mouse.y;
+            ed.scrollbar_drag_start_scroll = (thumb_y - scrollbar_y);
+        }
+        // Click on track to page jump
+        else if (hovering_track && ImGui::IsMouseClicked(0) && !hovering_thumb) {
+            if (mouse.y < thumb_y) {
+                ed.scroll_y -= canvas_h * 0.8f;
+            } else {
+                ed.scroll_y += canvas_h * 0.8f;
+            }
+        }
+    }
+}
+
 static void RenderEditor(App& app, ImVec2 canvas_p0, ImVec2 canvas_sz, bool canvas_hovered) {
     if (!app.has_doc()) return;
     Document& ed = app.doc();
@@ -600,7 +742,7 @@ static void RenderEditor(App& app, ImVec2 canvas_p0, ImVec2 canvas_sz, bool canv
     float canvas_h = canvas_sz.y;
 
     // Scroll con rueda del mouse (capturado desde el main loop)
-    if (canvas_hovered) {
+    if (canvas_hovered && !ed.scrollbar_dragging) {
         float wheel = io.MouseWheel;
         if (wheel != 0.0f) {
             ed.scroll_y -= wheel * line_height * 3.0f;
@@ -633,13 +775,8 @@ static void RenderEditor(App& app, ImVec2 canvas_p0, ImVec2 canvas_sz, bool canv
         dark ? IM_COL32(30, 30, 30, 255) : IM_COL32(240, 240, 240, 255)
     );
 
-    size_t current_line = 0;
-    size_t pos = 0;
-    while (pos < ed.buffer.size() && current_line < first_line) {
-        while (pos < ed.buffer.size() && ed.buffer.get(pos) != '\n') ++pos;
-        if (pos < ed.buffer.size()) ++pos;
-        ++current_line;
-    }
+    size_t current_line = first_line;
+    size_t pos = ed.buffer.pos_from_line_col(first_line, 0);
 
     float y = canvas_p0.y - fmodf(ed.scroll_y, line_height);
     std::vector<std::pair<std::string, int>> tokens;
@@ -740,6 +877,9 @@ static void RenderEditor(App& app, ImVec2 canvas_p0, ImVec2 canvas_sz, bool canv
     }
 
     draw_list->PopClipRect();
+
+    // RENDER SCROLLBAR (outside clip rect so it's always visible)
+    RenderScrollbar(ed, canvas_p0, canvas_sz, dark);
 }
 
 // ============================================================
@@ -751,6 +891,21 @@ static void HandleInput(App& app) {
     ImGuiIO& io = ImGui::GetIO();
     bool ctrl = io.KeyCtrl;
     bool shift = io.KeyShift;
+
+    // Si acabamos de cerrar un dialogo nativo, bloqueamos shortcuts hasta que suelten las teclas
+    if (app.block_shortcuts) {
+        if (!ctrl && !shift && !io.KeyAlt) {
+            app.block_shortcuts = false;
+        } else {
+            // Solo permitimos tipear caracteres normales, no shortcuts
+            for (int i = 0; i < io.InputQueueCharacters.Size; i++) {
+                ImWchar c = io.InputQueueCharacters[i];
+                if (c != 0 && c < 0x10000 && ((c >= 32 && c < 127) || c == '\n' || c == '\t'))
+                    ed.insert_char((char)c);
+            }
+            return;
+        }
+    }
 
     for (int i = 0; i < io.InputQueueCharacters.Size; i++) {
         ImWchar c = io.InputQueueCharacters[i];
@@ -767,14 +922,16 @@ static void HandleInput(App& app) {
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_F)) ed.show_search = !ed.show_search;
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_N)) app.new_doc();
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_O)) {
+        app.block_shortcuts = true;
         std::string f = OpenFileDialog(app.hwnd);
         if (!f.empty()) app.open_doc(f);
     }
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
         if (!ed.filename.empty()) { ed.save(); }
         else {
+            app.block_shortcuts = true;
             std::string f = SaveFileDialog(app.hwnd, "untitled.txt");
-            if (!f.empty()) { ed.filename = f; ed.display_name = GetFilenameFromPath(f); ed.save(); }
+            if (!f.empty()) { ed.filename = f; ed.display_name = GetFilenameFromPath(f); ed.save(); app.add_recent(f); }
         }
     }
     if (ctrl && ImGui::IsKeyPressed(ImGuiKey_A)) ed.select_all();
@@ -1016,7 +1173,8 @@ int main(int, char**)
         ImGui::SetNextWindowSize(io.DisplaySize);
         ImGui::Begin("FastEditor", NULL,
             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_MenuBar);
 
         // ---- MENU BAR ----
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6, 3));
@@ -1024,16 +1182,31 @@ int main(int, char**)
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("New File", "Ctrl+N")) app.new_doc();
                 if (ImGui::MenuItem("Open File...", "Ctrl+O")) {
+                    app.block_shortcuts = true;
                     std::string f = OpenFileDialog(hwnd);
                     if (!f.empty()) app.open_doc(f);
+                }
+                if (ImGui::BeginMenu("Open Recent", !app.recent_files.empty())) {
+                    for (const std::string& rf : app.recent_files) {
+                        std::string name = GetFilenameFromPath(rf);
+                        if (ImGui::MenuItem(name.c_str())) {
+                            app.open_doc(rf);
+                        }
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Clear Recent")) {
+                        app.recent_files.clear();
+                    }
+                    ImGui::EndMenu();
                 }
                 ImGui::Separator();
                 if (app.has_doc()) {
                     Document& ed = app.doc();
                     if (ImGui::MenuItem("Save", "Ctrl+S", false, !ed.filename.empty())) ed.save();
                     if (ImGui::MenuItem("Save As...", "Ctrl+Shift+S")) {
+                        app.block_shortcuts = true;
                         std::string f = SaveFileDialog(hwnd, ed.filename.empty() ? "untitled.txt" : ed.filename.c_str());
-                        if (!f.empty()) { ed.filename = f; ed.display_name = GetFilenameFromPath(f); ed.save(); }
+                        if (!f.empty()) { ed.filename = f; ed.display_name = GetFilenameFromPath(f); ed.save(); app.add_recent(f); }
                     }
                 }
                 ImGui::EndMenu();

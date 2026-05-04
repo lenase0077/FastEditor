@@ -35,21 +35,7 @@ Edition: 12
 
 Language: English
 
-Character set encoding: ASCII
-
-*** START OF THE PROJECT GUTENBERG EBOOK, THE ADVENTURES OF SHERLOCK HOLMES ***
-
-
-
-
-(Additional editing by Jose Menendez)
-
-
-
-THE ADVENTURES OF
-SHERLOCK HOLMES
-
-BY
+test
 
 SIR ARTHUR CONAN DOYLE
 
